@@ -42,7 +42,8 @@ class OpenaiVoice(Voice):
             data = {
                 'model': conf().get("text_to_voice_model") or const.TTS_1,
                 'input': text,
-                'voice': conf().get("tts_voice_id") or "alloy"
+                'voice': conf().get("tts_voice_id") or "alloy",
+                'speed': 0.8 # range [0.25,4]
             }
             response = requests.post(url, headers=headers, json=data)
             file_name = "tmp/" + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(0, 1000)) + ".mp3"
