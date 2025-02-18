@@ -9,17 +9,18 @@ import json
 import os
 import threading
 import time
-
 import requests
 
 from bridge.context import *
 from bridge.reply import *
 from channel.chat_channel import ChatChannel
+from channel import chat_channel
 from channel.wechat.wechat_message import *
 from common.expired_dict import ExpiredDict
 from common.log import logger
 from common.singleton import singleton
 from common.time_check import time_checker
+from common.utils import convert_webp_to_png, remove_markdown_symbol
 from config import conf, get_appdata_dir
 from lib import itchat
 from lib.itchat.content import *
@@ -95,11 +96,14 @@ def qrCallback(uuid, status, qrcode):
         print(qr_api4)
         print(qr_api2)
         print(qr_api1)
-
+        _send_qr_code([qr_api3, qr_api4, qr_api2, qr_api1])
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
         qr.make(fit=True)
-        qr.print_ascii(invert=True)
+        try:
+            qr.print_ascii(invert=True)
+        except UnicodeEncodeError:
+            print("ASCII QR code printing failed due to encoding issues.")
 
 
 @singleton
@@ -108,24 +112,57 @@ class WechatChannel(ChatChannel):
 
     def __init__(self):
         super().__init__()
-        self.receivedMsgs = ExpiredDict(60 * 60)
+        self.receivedMsgs = ExpiredDict(conf().get("expires_in_seconds", 3600))
+        self.auto_login_times = 0
 
     def startup(self):
-        itchat.instance.receivingRetryCount = 600  # 修改断线超时时间
-        # login by scan QRCode
-        hotReload = conf().get("hot_reload", False)
-        status_path = os.path.join(get_appdata_dir(), "itchat.pkl")
-        itchat.auto_login(
-            enableCmdQR=2,
-            hotReload=hotReload,
-            statusStorageDir=status_path,
-            qrCallback=qrCallback,
-        )
-        self.user_id = itchat.instance.storageClass.userName
-        self.name = itchat.instance.storageClass.nickName
-        logger.info("Wechat login success, user_id: {}, nickname: {}".format(self.user_id, self.name))
-        # start message listener
-        itchat.run()
+        try:
+            time.sleep(3)
+            logger.error("""[WechatChannel] 当前channel暂不可用，目前支持的channel有:
+                1. terminal: 终端
+                2. wechatmp: 个人公众号
+                3. wechatmp_service: 企业公众号
+                4. wechatcom_app: 企微自建应用
+                5. dingtalk: 钉钉
+                6. feishu: 飞书
+                7. web: 网页
+            可修改 config.json 配置文件的 channel_type 字段进行切换""")
+            # itchat.instance.receivingRetryCount = 600  # 修改断线超时时间
+            # # login by scan QRCode
+            # hotReload = conf().get("hot_reload", False)
+            # status_path = os.path.join(get_appdata_dir(), "itchat.pkl")
+            # itchat.auto_login(
+            #     enableCmdQR=2,
+            #     hotReload=hotReload,
+            #     statusStorageDir=status_path,
+            #     qrCallback=qrCallback,
+            #     exitCallback=self.exitCallback,
+            #     loginCallback=self.loginCallback
+            # )
+            # self.user_id = itchat.instance.storageClass.userName
+            # self.name = itchat.instance.storageClass.nickName
+            # logger.info("Wechat login success, user_id: {}, nickname: {}".format(self.user_id, self.name))
+            # # start message listener
+            # itchat.run()
+        except Exception as e:
+            logger.exception(e)
+
+    def exitCallback(self):
+        try:
+            from common.linkai_client import chat_client
+            if chat_client.client_id and conf().get("use_linkai"):
+                _send_logout()
+                time.sleep(2)
+                self.auto_login_times += 1
+                if self.auto_login_times < 100:
+                    chat_channel.handler_pool._shutdown = False
+                    self.startup()
+        except Exception as e:
+            pass
+
+    def loginCallback(self):
+        logger.debug("Login success")
+        _send_login_success()
 
     # handle_* 系列函数处理收到的消息后构造Context，然后传入produce函数中处理Context和发送回复
     # Context包含了消息的所有信息，包括以下属性
@@ -138,7 +175,6 @@ class WechatChannel(ChatChannel):
     #        msg: ChatMessage消息对象
     #        origin_ctype: 原始消息类型，语音转文字后，私聊时如果匹配前缀失败，会根据初始消息是否是语音来放宽触发规则
     #        desire_rtype: 希望回复类型，默认是文本回复，设置为ReplyType.VOICE是语音回复
-
     @time_checker
     @_check
     def handle_single(self, cmsg: ChatMessage):
@@ -179,7 +215,7 @@ class WechatChannel(ChatChannel):
             logger.debug(f"[WX]receive attachment msg, file_name={cmsg.content}")
         else:
             logger.debug("[WX]receive group msg: {}".format(cmsg.content))
-        context = self._compose_context(cmsg.ctype, cmsg.content, isgroup=True, msg=cmsg)
+        context = self._compose_context(cmsg.ctype, cmsg.content, isgroup=True, msg=cmsg, no_need_at=conf().get("no_need_at", False))
         if context:
             self.produce(context)
 
@@ -187,9 +223,11 @@ class WechatChannel(ChatChannel):
     def send(self, reply: Reply, context: Context):
         receiver = context["receiver"]
         if reply.type == ReplyType.TEXT:
+            reply.content = remove_markdown_symbol(reply.content)
             itchat.send(reply.content, toUserName=receiver)
             logger.info("[WX] sendMsg={}, receiver={}".format(reply, receiver))
         elif reply.type == ReplyType.ERROR or reply.type == ReplyType.INFO:
+            reply.content = remove_markdown_symbol(reply.content)
             itchat.send(reply.content, toUserName=receiver)
             logger.info("[WX] sendMsg={}, receiver={}".format(reply, receiver))
         elif reply.type == ReplyType.VOICE:
@@ -206,6 +244,12 @@ class WechatChannel(ChatChannel):
                 image_storage.write(block)
             logger.info(f"[WX] download image success, size={size}, img_url={img_url}")
             image_storage.seek(0)
+            if ".webp" in img_url:
+                try:
+                    image_storage = convert_webp_to_png(image_storage)
+                except Exception as e:
+                    logger.error(f"Failed to convert image: {e}")
+                    return
             itchat.send_image(image_storage, toUserName=receiver)
             logger.info("[WX] sendImage url={}, receiver={}".format(img_url, receiver))
         elif reply.type == ReplyType.IMAGE:  # 从文件读取图片
@@ -234,3 +278,30 @@ class WechatChannel(ChatChannel):
             video_storage.seek(0)
             itchat.send_video(video_storage, toUserName=receiver)
             logger.info("[WX] sendVideo url={}, receiver={}".format(video_url, receiver))
+
+def _send_login_success():
+    try:
+        from common.linkai_client import chat_client
+        if chat_client.client_id:
+            chat_client.send_login_success()
+    except Exception as e:
+        pass
+
+
+def _send_logout():
+    try:
+        from common.linkai_client import chat_client
+        if chat_client.client_id:
+            chat_client.send_logout()
+    except Exception as e:
+        pass
+
+
+def _send_qr_code(qrcode_list: list):
+    try:
+        from common.linkai_client import chat_client
+        if chat_client.client_id:
+            chat_client.send_qrcode(qrcode_list)
+    except Exception as e:
+        pass
+
