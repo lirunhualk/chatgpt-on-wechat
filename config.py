@@ -1,10 +1,10 @@
 # encoding:utf-8
 
+import copy
 import json
 import logging
 import os
 import pickle
-import copy
 
 from common.log import logger
 
@@ -15,6 +15,8 @@ available_setting = {
     "open_ai_api_key": "",  # openai api key
     # openai apibase，当use_azure_chatgpt为true时，需要设置对应的api base
     "open_ai_api_base": "https://api.openai.com/v1",
+    "claude_api_base": "https://api.anthropic.com/v1",  # claude api base
+    "gemini_api_base": "https://generativelanguage.googleapis.com",  # gemini api base
     "proxy": "",  # openai使用的代理
     # chatgpt模型， 当use_azure_chatgpt为true时，其名称为Azure上model deployment名称
     "model": "gpt-3.5-turbo",  # 可选择: gpt-4o, pt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini等模型，全部可选模型详见common/const.py文件
@@ -35,6 +37,7 @@ available_setting = {
     "group_name_white_list": ["ChatGPT测试群", "ChatGPT测试群2"],  # 开启自动回复的群名称列表
     "group_name_keyword_white_list": [],  # 开启自动回复的群名称关键词列表
     "group_chat_in_one_session": ["ChatGPT测试群"],  # 支持会话上下文共享的群名称
+    "group_shared_session": True,  # 群聊是否共享会话上下文（所有成员共享），默认为True。False时每个用户在群内有独立会话
     "nick_name_black_list": [],  # 用户昵称黑名单
     "group_welcome_msg": "",  # 配置新人进群固定欢迎语，不配置则使用随机风格欢迎
     "trigger_by_self": False,  # 是否允许机器人触发
@@ -148,6 +151,7 @@ available_setting = {
     "feishu_app_secret": "",  # 飞书机器人APP secret
     "feishu_token": "",  # 飞书 verification token
     "feishu_bot_name": "",  # 飞书机器人的名字
+    "feishu_event_mode": "websocket",  # 飞书事件接收模式: webhook(HTTP服务器) 或 websocket(长连接)
     # 钉钉配置
     "dingtalk_client_id": "",  # 钉钉机器人Client ID 
     "dingtalk_client_secret": "",  # 钉钉机器人Client Secret
@@ -179,10 +183,15 @@ available_setting = {
     "linkai_api_key": "",
     "linkai_app_code": "",
     "linkai_api_base": "https://api.link-ai.tech",  # linkAI服务地址
-    "Minimax_api_key": "",
+    "minimax_api_key": "",
     "Minimax_group_id": "",
     "Minimax_base_url": "",
     "web_port": 9899,
+    "agent": True,  # 是否开启Agent模式
+    "agent_workspace": "~/cow",  # agent工作空间路径，用于存储skills、memory等
+    "agent_max_context_tokens": 50000,  # Agent模式下最大上下文tokens
+    "agent_max_context_turns": 30,  # Agent模式下最大上下文记忆轮次
+    "agent_max_steps": 15,  # Agent模式下单次运行最大决策步数
 }
 
 
@@ -197,16 +206,26 @@ class Config(dict):
         self.user_datas = {}
 
     def __getitem__(self, key):
-        if key not in available_setting:
-            raise Exception("key {} not in available_setting".format(key))
+        # 跳过以下划线开头的注释字段
+        if not key.startswith("_") and key not in available_setting:
+            logger.warning("[Config] key '{}' not in available_setting, may not take effect".format(key))
         return super().__getitem__(key)
 
     def __setitem__(self, key, value):
-        if key not in available_setting:
-            raise Exception("key {} not in available_setting".format(key))
+        # 跳过以下划线开头的注释字段
+        if not key.startswith("_") and key not in available_setting:
+            logger.warning("[Config] key '{}' not in available_setting, may not take effect".format(key))
         return super().__setitem__(key, value)
 
     def get(self, key, default=None):
+        # 跳过以下划线开头的注释字段
+        if key.startswith("_"):
+            return super().get(key, default)
+        
+        # 如果key不在available_setting中，直接返回default
+        if key not in available_setting:
+            return super().get(key, default)
+        
         try:
             return self[key]
         except KeyError as e:
@@ -224,11 +243,11 @@ class Config(dict):
         try:
             with open(os.path.join(get_appdata_dir(), "user_datas.pkl"), "rb") as f:
                 self.user_datas = pickle.load(f)
-                logger.info("[Config] User datas loaded.")
+                logger.debug("[Config] User datas loaded.")
         except FileNotFoundError as e:
-            logger.info("[Config] User datas file not found, ignore.")
+            logger.debug("[Config] User datas file not found, ignore.")
         except Exception as e:
-            logger.info("[Config] User datas error: {}".format(e))
+            logger.warning("[Config] User datas error: {}".format(e))
             self.user_datas = {}
 
     def save_user_datas(self):
@@ -269,6 +288,15 @@ def drag_sensitive(config):
 
 def load_config():
     global config
+
+    # 打印 ASCII Logo
+    logger.info("  ____                _                    _   ")
+    logger.info(" / ___|_____      __ / \\   __ _  ___ _ __ | |_ ")
+    logger.info("| |   / _ \\ \\ /\\ / // _ \\ / _` |/ _ \\ '_ \\| __|")
+    logger.info("| |__| (_) \\ V  V // ___ \\ (_| |  __/ | | | |_ ")
+    logger.info(" \\____\\___/ \\_/\\_//_/   \\_\\__, |\\___|_| |_|\\__|")
+    logger.info("                          |___/                 ")
+    logger.info("")
     config_path = "./config.json"
     if not os.path.exists(config_path):
         logger.info("配置文件不存在，将使用config-template.json模板")
@@ -284,6 +312,9 @@ def load_config():
     # Some online deployment platforms (e.g. Railway) deploy project from github directly. So you shouldn't put your secrets like api key in a config file, instead use environment variables to override the default config.
     for name, value in os.environ.items():
         name = name.lower()
+        # 跳过以下划线开头的注释字段
+        if name.startswith("_"):
+            continue
         if name in available_setting:
             logger.info("[INIT] override config by environ args: {}={}".format(name, value))
             try:
@@ -301,6 +332,23 @@ def load_config():
         logger.debug("[INIT] set log level to DEBUG")
 
     logger.info("[INIT] load config: {}".format(drag_sensitive(config)))
+
+    # 打印系统初始化信息
+    logger.info("[INIT] ========================================")
+    logger.info("[INIT] System Initialization")
+    logger.info("[INIT] ========================================")
+    logger.info("[INIT] Channel: {}".format(config.get("channel_type", "unknown")))
+    logger.info("[INIT] Model: {}".format(config.get("model", "unknown")))
+
+    # Agent模式信息
+    if config.get("agent", False):
+        workspace = config.get("agent_workspace", "~/cow")
+        logger.info("[INIT] Mode: Agent (workspace: {})".format(workspace))
+    else:
+        logger.info("[INIT] Mode: Chat (在config.json中设置 \"agent\":true 可启用Agent模式)")
+
+    logger.info("[INIT] Debug: {}".format(config.get("debug", False)))
+    logger.info("[INIT] ========================================")
 
     config.load_user_datas()
 

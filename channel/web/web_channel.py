@@ -3,6 +3,7 @@ import time
 import web
 import json
 import uuid
+import io
 from queue import Queue, Empty
 from bridge.context import *
 from bridge.reply import Reply, ReplyType
@@ -49,8 +50,6 @@ class WebChannel(ChatChannel):
         self.msg_id_counter = 0  # 添加消息ID计数器
         self.session_queues = {}  # 存储session_id到队列的映射
         self.request_to_session = {}  # 存储request_id到session_id的映射
-        # web channel无需前缀
-        conf()["single_chat_prefix"] = [""]
 
 
     def _generate_msg_id(self):
@@ -122,18 +121,30 @@ class WebChannel(ChatChannel):
             if session_id not in self.session_queues:
                 self.session_queues[session_id] = Queue()
             
+            # Web channel 不需要前缀，确保消息能通过前缀检查
+            trigger_prefixs = conf().get("single_chat_prefix", [""])
+            if check_prefix(prompt, trigger_prefixs) is None:
+                # 如果没有匹配到前缀，给消息加上第一个前缀
+                if trigger_prefixs:
+                    prompt = trigger_prefixs[0] + prompt
+                    logger.debug(f"[WebChannel] Added prefix to message: {prompt}")
+            
             # 创建消息对象
             msg = WebMessage(self._generate_msg_id(), prompt)
             msg.from_user_id = session_id  # 使用会话ID作为用户ID
             
-            # 创建上下文
-            context = self._compose_context(ContextType.TEXT, prompt, msg=msg)
+            # 创建上下文，明确指定 isgroup=False
+            context = self._compose_context(ContextType.TEXT, prompt, msg=msg, isgroup=False)
+            
+            # 检查 context 是否为 None（可能被插件过滤等）
+            if context is None:
+                logger.warning(f"[WebChannel] Context is None for session {session_id}, message may be filtered")
+                return json.dumps({"status": "error", "message": "Message was filtered"})
 
-            # 添加必要的字段
+            # 覆盖必要的字段（_compose_context 会设置默认值，但我们需要使用实际的 session_id）
             context["session_id"] = session_id
+            context["receiver"] = session_id
             context["request_id"] = request_id
-            context["isgroup"] = False  # 添加 isgroup 字段
-            context["receiver"] = session_id  # 添加 receiver 字段
             
             # 异步处理消息 - 只传递上下文
             threading.Thread(target=self.produce, args=(context,)).start()
@@ -150,9 +161,6 @@ class WebChannel(ChatChannel):
         Poll for responses using the session_id.
         """
         try:
-            # 不记录轮询请求的日志
-            web.ctx.log_request = False
-            
             data = web.data()
             json_data = json.loads(data)
             session_id = json_data.get('session_id')
@@ -190,44 +198,50 @@ class WebChannel(ChatChannel):
 
     def startup(self):
         port = conf().get("web_port", 9899)
-        logger.info("""[WebChannel] 当前channel为web，可修改 config.json 配置文件中的 channel_type 字段进行切换。全部可用类型为：
-        1. web: 网页
-        2. terminal: 终端
-        3. wechatmp: 个人公众号
-        4. wechatmp_service: 企业公众号
-        5. wechatcom_app: 企微自建应用
-        6. dingtalk: 钉钉
-        7. feishu: 飞书""")
-        logger.info(f"Web对话网页已运行, 请使用浏览器访问 http://localhost:{port}/chat（本地运行）或 http://ip:{port}/chat（服务器运行） ")
+        
+        # 打印可用渠道类型提示
+        logger.info("[WebChannel] 当前channel为web，可修改 config.json 配置文件中的 channel_type 字段进行切换。全部可用类型为：")
+        logger.info("[WebChannel]   1. web              - 网页")
+        logger.info("[WebChannel]   2. terminal         - 终端")
+        logger.info("[WebChannel]   3. feishu           - 飞书")
+        logger.info("[WebChannel]   4. dingtalk         - 钉钉")
+        logger.info("[WebChannel]   5. wechatcom_app    - 企微自建应用")
+        logger.info("[WebChannel]   6. wechatmp         - 个人公众号")
+        logger.info("[WebChannel]   7. wechatmp_service - 企业公众号")
+        logger.info(f"[WebChannel] 🌐 本地访问: http://localhost:{port}/chat")
+        logger.info(f"[WebChannel] 🌍 服务器访问: http://YOUR_IP:{port}/chat (请将YOUR_IP替换为服务器IP)")
+        logger.info("[WebChannel] ✅ Web对话网页已运行")
         
         # 确保静态文件目录存在
         static_dir = os.path.join(os.path.dirname(__file__), 'static')
         if not os.path.exists(static_dir):
             os.makedirs(static_dir)
-            logger.info(f"Created static directory: {static_dir}")
+            logger.debug(f"[WebChannel] Created static directory: {static_dir}")
         
         urls = (
-            '/', 'RootHandler',  # 添加根路径处理器
+            '/', 'RootHandler',
             '/message', 'MessageHandler',
-            '/poll', 'PollHandler',  # 添加轮询处理器
+            '/poll', 'PollHandler',
             '/chat', 'ChatHandler',
-            '/assets/(.*)', 'AssetsHandler',  # 匹配 /assets/任何路径
+            '/config', 'ConfigHandler',
+            '/assets/(.*)', 'AssetsHandler',
         )
         app = web.application(urls, globals(), autoreload=False)
         
-        # 禁用web.py的默认日志输出
-        import io
-        from contextlib import redirect_stdout
+        # 完全禁用web.py的HTTP日志输出
+        web.httpserver.LogMiddleware.log = lambda self, status, environ: None
         
-        # 配置web.py的日志级别为ERROR，只显示错误
+        # 配置web.py的日志级别为ERROR
         logging.getLogger("web").setLevel(logging.ERROR)
-        
-        # 禁用web.httpserver的日志
         logging.getLogger("web.httpserver").setLevel(logging.ERROR)
         
-        # 临时重定向标准输出，捕获web.py的启动消息
-        with redirect_stdout(io.StringIO()):
+        # 抑制 web.py 默认的服务器启动消息
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
             web.httpserver.runsimple(app.wsgifunc(), ("0.0.0.0", port))
+        finally:
+            sys.stdout = old_stdout
 
 
 class RootHandler:
@@ -252,6 +266,30 @@ class ChatHandler:
         file_path = os.path.join(os.path.dirname(__file__), 'chat.html')
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
+
+
+class ConfigHandler:
+    def GET(self):
+        """返回前端需要的配置信息"""
+        try:
+            use_agent = conf().get("agent", False)
+            
+            if use_agent:
+                title = "CowAgent"
+                subtitle = "我可以帮你解答问题、管理计算机、创造和执行技能，并通过长期记忆不断成长"
+            else:
+                title = "AI 助手"
+                subtitle = "我可以回答问题、提供信息或者帮助您完成各种任务"
+            
+            return json.dumps({
+                "status": "success",
+                "use_agent": use_agent,
+                "title": title,
+                "subtitle": subtitle
+            })
+        except Exception as e:
+            logger.error(f"Error getting config: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
 
 
 class AssetsHandler:
